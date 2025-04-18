@@ -26,8 +26,12 @@ from rich.panel import Panel
 from rich.table import Table
 from colorsys import hsv_to_rgb
 from dataclasses import dataclass
-from ring_buffer import MetricsBuffer
 import math
+import ctypes
+from ctypes import c_int64, c_uint64, c_uint8, Structure, c_int32
+from multiprocessing import shared_memory, Lock
+import atexit # For cleanup
+import sys # For platform check
 
 # ─────────── Configuration Constants ──────────────────────────────────────
 # Core configuration
@@ -39,647 +43,562 @@ POKER_CATS_PER_U32 = 8  # 32 bits / 4 bits per category
 HIST_WIDTH = 35
 INV_MAX = DECK_SIZE * (DECK_SIZE-1) // 2  # 1326 possible inversions
 RUN_BINS = DECK_SIZE  # run lengths 1..52
-INV_BUCKETS = numba.int32(64)  # Mark as Numba constant
-INV_BUCKETS = 64  # Number of buckets for inversion histogram
+INV_BUCKETS = numba.int32(64)  # Number of buckets for inversion histogram
 RUN_BUCKETS = 16  # Number of buckets for run length histogram
 
 # Performance tuning
 UI_FPS = 60
-CPU_CHUNK_SIZE = 50_000
 GPU_SHUFFLES_THR = 5000  # ~128×256×5k ≈ 163M shuffles per kernel launch
 WARP_SIZE = 32
 INV_SAMPLE_SIZE = 1000  # Sample 1000 pairs for higher precision
-CPU_WORKERS = max(1, mp.cpu_count() - 1)
 
 # Poker hand masks
 ROYAL_MASK = (1<<0)|(1<<9)|(1<<10)|(1<<11)|(1<<12)
 CONSEC5 = 0b11111
 
-# Xoshiro256++ constants
-XOSHIRO256_MULT = np.uint64(0x82A2B175229D6A5B)
-XOSHIRO256_ROT1 = np.uint64(17)
-XOSHIRO256_ROT2 = np.uint64(45)
-XOSHIRO256_ROT3 = np.uint64(23)
-
 # Precompute bar color
 _r,_g,_b = hsv_to_rgb(0.66,1,1)
 BAR_COLOR = f"rgb({int(_r*255)},{int(_g*255)},{int(_b*255)})"
+
+# Add CPU specific constants if needed
+CPU_CHUNK_SIZE = 10_000 # Number of shuffles per chunk on CPU
 
 @dataclass(frozen=True)
 class Config:
     # Core configuration
     DECK_SIZE: int = DECK_SIZE
     HIST_BINS: int = HIST_BINS
-    POKER_CAT_BITS: int = POKER_CAT_BITS
-    POKER_CAT_MASK: int = POKER_CAT_MASK
-    POKER_CATS_PER_U32: int = POKER_CATS_PER_U32
+    POKER_CATEGORIES: int = 10 # Added
     HIST_WIDTH: int = HIST_WIDTH
     INV_MAX: int = INV_MAX
     RUN_BINS: int = RUN_BINS
+    INV_BUCKETS: int = INV_BUCKETS
+    RUN_BUCKETS: int = RUN_BUCKETS
     
     # Performance tuning
     UI_FPS: int = UI_FPS
-    CPU_CHUNK_SIZE: int = CPU_CHUNK_SIZE
     GPU_SHUFFLES_THR: int = GPU_SHUFFLES_THR
     WARP_SIZE: int = WARP_SIZE
     INV_SAMPLE_SIZE: int = INV_SAMPLE_SIZE
-    CPU_WORKERS: int = CPU_WORKERS
     
     # Poker hand masks
     ROYAL_MASK: int = ROYAL_MASK
     CONSEC5: int = CONSEC5
-    
-    # Xoshiro256++ constants
-    XOSHIRO256_MULT: np.uint64 = XOSHIRO256_MULT
-    XOSHIRO256_ROT1: np.uint64 = XOSHIRO256_ROT1
-    XOSHIRO256_ROT2: np.uint64 = XOSHIRO256_ROT2
-    XOSHIRO256_ROT3: np.uint64 = XOSHIRO256_ROT3
+    CPU_CHUNK_SIZE: int = CPU_CHUNK_SIZE # Add CPU chunk size
 
 cfg = Config()
 
-# ─────────── Utility Functions ────────────────────────────────────────────
-@njit(nogil=True, fastmath=True, cache=True)
-def xoshiro256pp_next(state):
-    """Generate next random number using Xoshiro256++."""
-    result = np.uint64(0)
-    t = state[1] << np.uint64(17)
-    
-    state[2] ^= state[0]
-    state[3] ^= state[1]
-    state[1] ^= state[2]
-    state[0] ^= state[3]
-    
-    state[2] ^= t
-    state[3] = (state[3] << np.uint64(45)) | (state[3] >> np.uint64(19))
-    
-    result = (state[0] + state[3]) >> np.uint64(23)
-    result ^= state[0] + state[3]
-    
-    return result
+# ─────────── Shared Metrics Structure ───────────────────────────────────
 
-@njit(nogil=True, fastmath=True, cache=True)
-def xoshiro256pp_jump(state):
-    """Jump function for Xoshiro256++."""
-    jump = np.array([0x180ec6d33cfd0aba, 0xd5a61266f0c9392c,
-                     0xa9582618e03fc9aa, 0x39abdc4529b1661c], dtype=np.uint64)
-    
-    s0 = np.uint64(0)
-    s1 = np.uint64(0)
-    s2 = np.uint64(0)
-    s3 = np.uint64(0)
-    
-    for i in range(4):
-        for b in range(64):
-            if jump[i] & (np.uint64(1) << np.uint64(b)):
-                s0 ^= state[0]
-                s1 ^= state[1]
-                s2 ^= state[2]
-                s3 ^= state[3]
-            xoshiro256pp_next(state)
-    
-    state[0] = s0
-    state[1] = s1
-    state[2] = s2
-    state[3] = s3
+# Define the layout for the *data* part of the shared memory
+class MetricsDataStruct(Structure):
+    _fields_ = [
+        # Data arrays
+        ('hist_data', c_int32 * cfg.HIST_BINS),
+        ('poker_data', c_int32 * cfg.POKER_CATEGORIES), # Use POKER_CATEGORIES
+        ('run_length_data', c_int32 * cfg.RUN_BUCKETS),
+        ('inversion_data', c_int32 * cfg.INV_BUCKETS),
+        # Scalar metrics
+        ('total', c_int64),
+        ('rises', c_int64),
+        ('dup', c_int64),
+        # Timestamp (optional, can be added by writer or reader)
+        # ('timestamp', c_double) # Example if adding timestamp
+    ]
 
-def init_rng_state():
-    """Initialize a Xoshiro256++ state."""
-    state = np.zeros(4, dtype=np.uint64)
-    for i in range(4):
-        state[i] = int.from_bytes(os.urandom(8), 'little')
-    return state
+# Define the layout for the *control block* in shared memory
+class ControlBlockStruct(Structure):
+     _fields_ = [
+         ('head', c_int64), # Sequence number for writes
+         ('tail', c_int64)  # Sequence number for reads
+     ]
 
-# ─────────── Poker Hand Categorization ────────────────────────────────────
-def build_poker_lut():
-    """Build the poker hand lookup table using efficient vectorized operations."""
-    # Create arrays for all possible rank masks
-    masks = np.arange(1<<13, dtype=np.uint16)
-    
-    # Count bits in each mask
-    bit_counts = np.array([m.bit_count() for m in masks])
-    valid_masks = masks[bit_counts == 5]
-    
-    # Initialize LUTs
-    rank_lut = np.zeros(1<<13, dtype=np.uint8)
-    flush_lut = np.zeros(1<<13, dtype=np.uint8)
-    
-    # Check for straights and royal flushes
-    straight_masks = np.array([CONSEC5 << i for i in range(9)], dtype=np.uint16)
-    is_straight = np.any((valid_masks[:, None] & straight_masks) == straight_masks, axis=1)
-    is_royal = (valid_masks & ROYAL_MASK) == ROYAL_MASK
-    
-    # Determine flush categories (4 bits)
-    cat_flush = np.where(is_royal, 8, np.where(is_straight, 8, 5))
-    flush_lut[valid_masks] = cat_flush
-    
-    # Determine non-flush categories (4 bits)
-    cat_non_flush = np.where(is_royal | is_straight, 4, 0)  # Start with straights
-    rank_lut[valid_masks] = cat_non_flush
-    
-    # Process remaining categories (pairs, trips, quads)
-    for mask in valid_masks:
-        # Count pairs, trips, quads
-        pairs = 0
-        trips = 0
-        quads = 0
-        for j in range(13):
-            if (mask >> j) & 1:
-                if (mask >> (j+1)) & 1:
-                    pairs += 1
-                    if (mask >> (j+2)) & 1:
-                        trips += 1
-                        if (mask >> (j+3)) & 1:
-                            quads += 1
+# Calculate sizes
+METRICS_DATA_SIZE = ctypes.sizeof(MetricsDataStruct)
+CONTROL_BLOCK_SIZE = ctypes.sizeof(ControlBlockStruct)
+TOTAL_SHM_SIZE = CONTROL_BLOCK_SIZE + METRICS_DATA_SIZE
+
+# Name for the shared memory block (unique)
+# Using PID is good practice for avoiding collisions from stale runs
+SHM_NAME = f"shuffle_metrics_shm_{os.getpid()}"
+
+class SafeMetricsBuffer:
+    """Process-safe buffer for simulation metrics using shared_memory and Lock."""
+
+    def __init__(self, create=False, name=SHM_NAME):
+        self.name = name
+        self.created = create
+        self.shm = None
+        self.lock = Lock()
+        # Initialize view attributes to None
+        self.control_block = None
+        self.metrics_data = None
+
+        try:
+            if create:
+                self.shm = shared_memory.SharedMemory(name=self.name, create=True, size=TOTAL_SHM_SIZE)
+                print(f"Created shared memory: {self.name} ({TOTAL_SHM_SIZE} bytes)")
+                control_block_view = ControlBlockStruct.from_buffer(self.shm.buf)
+                control_block_view.head = 0
+                control_block_view.tail = 0
+                del control_block_view # Release temp view
+            else:
+                self.shm = shared_memory.SharedMemory(name=self.name, create=False)
+                print(f"Attached to shared memory: {self.name}")
+
+            # Get persistent views
+            self.control_block = ControlBlockStruct.from_buffer(self.shm.buf)
+            # Use slice for offset
+            self.metrics_data = MetricsDataStruct.from_buffer(self.shm.buf[CONTROL_BLOCK_SIZE:])
+
+            if create:
+                 # Register unlink for cleanup, unlink calls close internally
+                 atexit.register(self.unlink)
+
+        except FileNotFoundError:
+             print(f"Error: Shared memory block '{self.name}' not found. Was the creating process started?")
+             raise
+        except Exception as e:
+             print(f"Error initializing SafeMetricsBuffer ('{self.name}'): {e}")
+             # Ensure close is called during failed init cleanup
+             self.close()
+             raise
+
+    def write_metrics(self, metrics_dict):
+        """Write metrics to the shared buffer. Assumes only one writer."""
+        with self.lock:
+            try:
+                if 'hist' in metrics_dict:
+                     np.copyto(np.frombuffer(self.metrics_data.hist_data, dtype=np.int32), metrics_dict['hist'])
+                if 'poker' in metrics_dict:
+                     np.copyto(np.frombuffer(self.metrics_data.poker_data, dtype=np.int32), metrics_dict['poker'])
+                if 'run_hist' in metrics_dict:
+                     np.copyto(np.frombuffer(self.metrics_data.run_length_data, dtype=np.int32), metrics_dict['run_hist'])
+                if 'inv_hist' in metrics_dict:
+                     np.copyto(np.frombuffer(self.metrics_data.inversion_data, dtype=np.int32), metrics_dict['inv_hist'])
+                self.metrics_data.total = metrics_dict.get('total', 0)
+                self.metrics_data.rises = metrics_dict.get('rises', 0)
+                self.metrics_data.dup = metrics_dict.get('duplicates', 0)
+                self.control_block.head += 1
+            except AttributeError:
+                print("SafeMetricsBuffer write error: Buffer likely closed or views not initialized.")
+            except KeyError as e:
+                print(f"SafeMetricsBuffer write error: Missing key {e}")
+            except Exception as e:
+                print(f"SafeMetricsBuffer write error: {e}")
+
+    def read_metrics(self):
+        """Read the latest metrics data if available. Assumes one reader."""
+        with self.lock:
+            try:
+                head = self.control_block.head
+                tail = self.control_block.tail
+                if head == tail: return None
+                # Ensure correct dtypes when reading from buffer
+                metrics_dict = {
+                    'hist': np.copy(np.frombuffer(self.metrics_data.hist_data, dtype=np.int32)),
+                    'poker': np.copy(np.frombuffer(self.metrics_data.poker_data, dtype=np.int32)),
+                    'run_hist': np.copy(np.frombuffer(self.metrics_data.run_length_data, dtype=np.int32)),
+                    'inv_hist': np.copy(np.frombuffer(self.metrics_data.inversion_data, dtype=np.int32)),
+                    'total': self.metrics_data.total,      # Already int64 from ctypes
+                    'rises': self.metrics_data.rises,      # Already int64 from ctypes
+                    'duplicates': self.metrics_data.dup,  # Already int64 from ctypes
+                    'timestamp': perf_counter()
+                }
+                self.control_block.tail = head
+                return metrics_dict
+            except AttributeError:
+                 print("SafeMetricsBuffer read error: Buffer likely closed or views not initialized.")
+                 return None
+            except Exception as e:
+                 print(f"SafeMetricsBuffer read error: {e}")
+                 return None
+
+    def close(self):
+        """Close the shared memory view, releasing internal pointers."""
+        print(f"Closing shared memory view for: {self.name}")
+        # --- Release ctypes views FIRST ---
+        if hasattr(self, 'control_block') and self.control_block is not None:
+            # print(f"Deleting control_block view for {self.name}")
+            del self.control_block
+            self.control_block = None
+        if hasattr(self, 'metrics_data') and self.metrics_data is not None:
+            # print(f"Deleting metrics_data view for {self.name}")
+            del self.metrics_data
+            self.metrics_data = None
+        # ----------------------------------
         
-        # Update category if not a straight
-        if not (is_royal[mask == valid_masks][0] or is_straight[mask == valid_masks][0]):
-            if quads:
-                rank_lut[mask] = 7  # Four of a kind
-            elif trips and pairs:
-                rank_lut[mask] = 6  # Full house
-            elif trips:
-                rank_lut[mask] = 3  # Three of a kind
-            elif pairs == 2:
-                rank_lut[mask] = 2  # Two pair
-            elif pairs == 1:
-                rank_lut[mask] = 1  # One pair
-    
-    # Pack LUTs into 32-bit words (8 categories per word)
-    packed_size = (1<<14 + POKER_CATS_PER_U32 - 1) // POKER_CATS_PER_U32
-    packed_lut = np.zeros(packed_size, dtype=np.uint32)
-    
-    # Pack rank LUT (first 13 bits)
-    for i in range(1<<13):
-        word_idx = i // POKER_CATS_PER_U32
-        bit_shift = (i % POKER_CATS_PER_U32) * POKER_CAT_BITS
-        packed_lut[word_idx] |= (rank_lut[i] & POKER_CAT_MASK) << bit_shift
-    
-    # Pack flush LUT (next 13 bits)
-    for i in range(1<<13):
-        word_idx = (i + (1<<13)) // POKER_CATS_PER_U32
-        bit_shift = ((i + (1<<13)) % POKER_CATS_PER_U32) * POKER_CAT_BITS
-        packed_lut[word_idx] |= (flush_lut[i] & POKER_CAT_MASK) << bit_shift
-    
-    return packed_lut
+        # Now close the shared memory object itself
+        if self.shm:
+            try:
+                 self.shm.close()
+                 # print(f"shm.close() called for {self.name}")
+            except Exception as e:
+                 print(f"Error closing shared memory object {self.name}: {e}")
+            # Prevent further use
+            self.shm = None
 
-# Build the packed poker LUT once at module load
-lut_packed = build_poker_lut()
+    def unlink(self):
+        """Remove the shared memory block (called by creator)."""
+        print(f"Unlinking shared memory: {self.name}")
+        # Ensure the view is closed first (close handles releasing pointers)
+        self.close()
+        # Now attempt to unlink
+        try:
+            # Need a temporary handle to unlink if self.shm was already closed/nulled
+            temp_shm = shared_memory.SharedMemory(name=self.name)
+            temp_shm.unlink()
+            print(f"Successfully unlinked {self.name}")
+        except FileNotFoundError:
+            print(f"Shared memory {self.name} already unlinked or never created.")
+        except Exception as e:
+            print(f"Error unlinking shared memory {self.name}: {e}")
 
-# Precompute triangular mapping arrays
-pre_i = np.zeros(INV_MAX, dtype=np.uint8)
-pre_j = np.zeros(INV_MAX, dtype=np.uint8)
-idx = 0
-for i in range(DECK_SIZE):
-    for j in range(i + 1, DECK_SIZE):
-        pre_i[idx] = i
-        pre_j[idx] = j
-        idx += 1
+    def __del__(self):
+        # Optional: Ensure close is called if the object is garbage collected
+        # Can be problematic with process cleanup, rely on explicit close/unlink
+        # print(f"SafeMetricsBuffer __del__ called for {self.name}")
+        # self.close()
+        pass
 
-# Initialize device arrays
-initial_d = cuda.to_device(np.arange(DECK_SIZE, dtype=np.int8))
-lut_d = cuda.to_device(lut_packed)
-const_indices_i = cuda.to_device(pre_i)
-const_indices_j = cuda.to_device(pre_j)
+# ─────────── Utility Functions ────────────────────────────────────────────
 
-@cuda.jit(device=True, inline=True)
-def get_poker_cat(mask, flush):
-    """Get poker category from packed LUT using vectorized loads."""
-    # Calculate index in packed LUT
-    idx = mask | (flush << 13)
-    word_idx = idx // POKER_CATS_PER_U32
-    bit_shift = (idx % POKER_CATS_PER_U32) * POKER_CAT_BITS
-    
-    # Load packed word and extract category
-    packed_word = cuda.ldg(lut_d, word_idx)
-    return (packed_word >> bit_shift) & POKER_CAT_MASK
 
-@cuda.jit(device=True, inline=True)
-def compute_run_lengths(deck, block_run_hist):
-    """Compute run lengths and update histogram."""
+# ─────────── Poker Hand Categorization (Shared CPU/GPU Logic) ───────────
+# Poker categories mapping
+POKER_CATEGORIES_MAP = {
+    0: "High Card", 1: "One Pair", 2: "Two Pair", 3: "3 of a Kind", 4: "Straight",
+    5: "Flush", 6: "Full House", 7: "4 of a Kind", 8: "Straight Flush", 9: "Royal Flush"
+}
+
+# ─────────── Poker Hand Categorization (GPU Device Function) ──────────────
+@cuda.jit(device=True, fastmath=True)
+def compute_poker_category_device(deck5):
+    """Categorize a 5-card poker hand directly on the GPU."""
+    # Categories: 0:HighCard, 1:Pair, 2:TwoPair, 3:Trips, 4:Straight,
+    #             5:Flush, 6:FullHouse, 7:Quads, 8:StraightFlush, 9:RoyalFlush
+
+    ranks = cuda.local.array(5, dtype=numba.int8)
+    suits = cuda.local.array(5, dtype=numba.int8)
+    rank_counts = cuda.local.array(13, dtype=numba.int8) # Counts for ranks 0-12 (2-Ace)
+    for i in range(13): rank_counts[i] = 0
+
+    flush = True
+    first_suit = deck5[0] // 13
+
+    for i in range(5):
+        card = deck5[i]
+        rank = card % 13 # 0=2, ..., 8=10, 9=J, 10=Q, 11=K, 12=A
+        suit = card // 13
+        ranks[i] = rank
+        suits[i] = suit
+        rank_counts[rank] += 1
+        if suit != first_suit: flush = False
+
+    # Sort ranks for straight check (simple insertion sort for 5 elements)
+    for i in range(1, 5):
+        key = ranks[i]
+        j = i - 1
+        while j >= 0 and ranks[j] > key:
+            ranks[j + 1] = ranks[j]
+            j -= 1
+        ranks[j + 1] = key
+
+    # Check for straight
+    straight = True
+    # Ace-low straight check (A, 2, 3, 4, 5 -> ranks 12, 0, 1, 2, 3)
+    is_ace_low = (ranks[0]==0 and ranks[1]==1 and ranks[2]==2 and ranks[3]==3 and ranks[4]==12)
+    if not is_ace_low:
+        for i in range(4):
+            if ranks[i+1] != ranks[i] + 1:
+                straight = False
+                break
+    else:
+         straight = True # Ace-low counts as straight
+
+    # Check for Royal Flush (Ace-high straight + flush)
+    is_royal = straight and flush and ranks[4] == 12 and ranks[0]==8 # Ranks 10,J,Q,K,A -> 8,9,10,11,12
+
+    if is_royal:
+        return 9
+    if straight and flush: # Includes Ace-low straight flush
+        return 8
+
+    # Check rank counts for pairs, trips, quads, full house
+    has_quads = False
+    has_trips = False
+    pairs = 0
+    for i in range(13):
+        if rank_counts[i] == 4: has_quads = True
+        if rank_counts[i] == 3: has_trips = True
+        if rank_counts[i] == 2: pairs += 1
+
+    if has_quads:
+        return 7
+    if has_trips and pairs == 1:
+        return 6 # Full House
+    if flush:
+        return 5
+    if straight:
+        return 4
+    if has_trips:
+        return 3
+    if pairs == 2:
+        return 2
+    if pairs == 1:
+        return 1
+
+    return 0 # High Card
+
+# ─────────── Poker Hand Categorization (CPU JIT Function) ───────────────
+@njit(nogil=True, cache=True)
+def compute_poker_category_cpu(deck5):
+    """Categorize a 5-card poker hand on the CPU (Numba JIT)."""
+    # Logic mirrors the GPU version but uses standard operations
+    ranks = np.empty(5, dtype=np.int8)
+    suits = np.empty(5, dtype=np.int8)
+    rank_counts = np.zeros(13, dtype=np.int8)
+
+    flush = True
+    first_suit = deck5[0] // 13
+
+    for i in range(5):
+        card = deck5[i]
+        rank = card % 13
+        suit = card // 13
+        ranks[i] = rank
+        suits[i] = suit
+        rank_counts[rank] += 1
+        if suit != first_suit: flush = False
+
+    # Sort ranks (use np.sort which is JIT-compatible)
+    ranks.sort()
+
+    # Check for straight
+    straight = True
+    is_ace_low = (ranks[0]==0 and ranks[1]==1 and ranks[2]==2 and ranks[3]==3 and ranks[4]==12)
+    if not is_ace_low:
+        for i in range(4):
+            if ranks[i+1] != ranks[i] + 1:
+                straight = False
+                break
+    else:
+        straight = True
+
+    # Royal Flush
+    is_royal = straight and flush and ranks[4] == 12 and ranks[0]==8
+    if is_royal: return 9
+    if straight and flush: return 8
+
+    # Rank counts
+    has_quads = False; has_trips = False; pairs = 0
+    for i in range(13):
+        count = rank_counts[i]
+        if count == 4: has_quads = True
+        if count == 3: has_trips = True
+        if count == 2: pairs += 1
+
+    if has_quads: return 7
+    if has_trips and pairs == 1: return 6 # Full House
+    if flush: return 5
+    if straight: return 4
+    if has_trips: return 3
+    if pairs == 2: return 2
+    if pairs == 1: return 1
+    return 0 # High Card
+
+# ─────────── CPU Simulation Logic ─────────────────────────────────────── 
+@njit(nogil=True, cache=True)
+def shuffle_deck_cpu(deck, rng_state):
+    """Fisher-Yates shuffle for CPU (Numba JIT). Uses np.random."""
+    n = len(deck)
+    for i in range(n - 1, 0, -1):
+        j = rng_state.integers(0, i + 1) # Equivalent to int(rng() * (i + 1))
+        deck[i], deck[j] = deck[j], deck[i]
+
+@njit(nogil=True, cache=True)
+def compute_metrics_cpu(deck, deck_size):
+    """Calculate similarity and runs for a deck (CPU JIT)."""
+    simc = 0
+    runs = 1
+    prev_card = deck[0]
+    exact_match = True
+    initial_val = np.int8(0)
+
+    for k in range(deck_size):
+        c = deck[k]
+        # Similarity to sorted 0..N-1
+        simc += (c == k)
+        # Exact match to initial state (requires initial state, pass or recreate)
+        # For simplicity, assume initial state is always 0..N-1 here
+        exact_match &= (c == initial_val)
+        initial_val += 1
+        # Runs
+        if k > 0:
+            runs += (c < prev_card)
+        prev_card = c
+        
+    return simc, runs, exact_match
+
+@njit(nogil=True, cache=True)
+def compute_exact_inversions_cpu(deck):
+    """Calculate the exact number of inversions (CPU JIT O(N^2))."""
+    count = 0
+    n = len(deck)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if deck[i] > deck[j]:
+                count += 1
+    return count
+
+@njit(nogil=True, cache=True)
+def compute_run_buckets_cpu(deck):
+    """Calculate run length histogram buckets (CPU JIT)."""
+    run_hist = np.zeros(cfg.RUN_BUCKETS, dtype=np.int32)
     run_len = 1
     prev = deck[0]
-    
-    for i in range(1, DECK_SIZE):
+    bucket_width_run = cfg.DECK_SIZE // cfg.RUN_BUCKETS or 1
+
+    for i in range(1, cfg.DECK_SIZE):
         if deck[i] > prev:
             run_len += 1
         else:
-            # Bucket (length-1) to match CPU code
-            bucket = min(RUN_BUCKETS-1, (run_len-1) // (DECK_SIZE // RUN_BUCKETS))
-            cuda.atomic.add(block_run_hist, bucket, 1)
+            bucket = min(cfg.RUN_BUCKETS - 1, (run_len - 1) // bucket_width_run)
+            run_hist[bucket] += 1
             run_len = 1
         prev = deck[i]
-    
-    # Handle the last run
-    bucket = min(RUN_BUCKETS-1, (run_len-1) // (DECK_SIZE // RUN_BUCKETS))
-    cuda.atomic.add(block_run_hist, bucket, 1)
+    # Last run
+    bucket = min(cfg.RUN_BUCKETS - 1, (run_len - 1) // bucket_width_run)
+    run_hist[bucket] += 1
+    return run_hist
 
+# ─────────── CUDA Kernels (Split) ───────────────────────────────────────
+
+# --- Device Helper Functions ---
 @cuda.jit(device=True, inline=True)
-def compute_inversions(deck, rng_states, gid, lid):
-    """Compute inversion counts using high-precision sampling and warp-level reduction."""
-    samples_per_thread = INV_SAMPLE_SIZE // WARP_SIZE
-    val = 0  # Local count for this thread
-    
+def compute_inversions(deck, rng_states, gid, lid, 
+                       const_indices_i_d, const_indices_j_d):
+    """Compute inversion counts using sampling and Cooperative Groups warp reduction."""
+    samples_per_thread = cfg.INV_SAMPLE_SIZE // cfg.WARP_SIZE
+    if samples_per_thread <= 0: samples_per_thread = 1
+    val = 0
     for s in range(samples_per_thread):
-        # Sample without replacement using precomputed indices
-        pair = int(xoroshiro128p_uniform_float64(rng_states, gid) * INV_MAX)
-        val += (deck[const_indices_j[pair]] > deck[const_indices_i[pair]])
-    
-    # Warp-level reduction using shuffle down
-    lane_id = lid % WARP_SIZE
-    # shuffle down by power-of-2 offsets with sync mask
-    for offset in (16, 8, 4, 2, 1):
-        val = cuda.shfl_down_sync(0xffffffff, val, offset)
-    
-    # Lane 0 of each warp now holds its sum
-    if lane_id == 0:
-        # Scale the sample count to estimate total inversions
-        # With without-replacement sampling, we sample from N*(N-1)/2 pairs
-        total_inv = (val * INV_MAX) // INV_SAMPLE_SIZE
-        # Scale and down-bucket the estimated count
-        bucket = min(INV_BUCKETS-1, total_inv // (INV_MAX // INV_BUCKETS))
-        return bucket
-    return 0
-
-@cuda.jit(device=True, inline=True)
-def compute_deck_metrics(deck, initial_const, block_hist, block_r):
-    """Compute deck-level metrics (simc, runs, duplicates)."""
-    simc = 0
-    runs = 1
-    prev = deck[0]
-    match = True
-    
-    for k in range(DECK_SIZE):
-        c = deck[k]
-        match &= (c == initial_const[k])
-        simc += (c == k)
-        if k > 0:
-            runs += (c < prev)
-        prev = c
-    
-    if match: cuda.atomic.add(block_r, 1, 1)  # Increment block-level duplicate counter
-    cuda.atomic.add(block_hist, simc, 1)
-    cuda.atomic.add(block_r, 0, runs)
-
-@cuda.jit(device=True, inline=True)
-def compute_poker_mask(deck, block_poker):
-    """Compute poker hand mask and update histogram."""
-    mask = 0
-    s0 = deck[0] // 13
-    flush = 1
-    
-    # Unroll poker mask and flush check
-    for i in range(5):
-        c = deck[i]
-        mask |= 1 << (c % 13)
-        flush &= (c // 13 == s0)
-    
-    cuda.atomic.add(block_poker, get_poker_cat(mask, flush), 1)
-
-@cuda.jit(device=True, inline=True)
-def reduce_block_histograms_child(block_hist, block_poker, block_inv_hist, block_r, block_run_hist,
-                                hist, poker, inv_hist, run_hist, rises, total, dup):
-    """Child kernel for final reduction of block histograms."""
-    tx = cuda.threadIdx.x
-    bdx = cuda.blockDim.x
-    
-    # Each thread handles a portion of the histograms
-    for i in range(tx, HIST_BINS, bdx):
-        if block_hist[i] > 0:
-            cuda.atomic.add(hist, i, block_hist[i])
-    
-    for i in range(tx, POKER_CATS_PER_U32, bdx):
-        if block_poker[i] > 0:
-            cuda.atomic.add(poker, i, block_poker[i])
-    
-    for i in range(tx, INV_BUCKETS, bdx):
-        if block_inv_hist[i] > 0:
-            cuda.atomic.add(inv_hist, i, block_inv_hist[i])
-    
-    for i in range(tx, RUN_BUCKETS, bdx):
-        if block_run_hist[i] > 0:
-            cuda.atomic.add(run_hist, i, block_run_hist[i])
-    
-    # Single thread updates global counters
-    if tx == 0:
-        cuda.atomic.add(rises, 0, block_r[0])
-        cuda.atomic.add(total, 0, bdx * GPU_SHUFFLES_THR)
-        cuda.atomic.add(dup, 0, block_r[1])
+        pair_idx_f = xoroshiro128p_uniform_float64(rng_states, gid)
+        pair = int(pair_idx_f * cfg.INV_MAX)
+        if pair >= cfg.INV_MAX: pair = cfg.INV_MAX - 1
+        # Use passed device arrays
+        idx_i = const_indices_i_d[pair]
+        idx_j = const_indices_j_d[pair]
+        val += (deck[idx_j] > deck[idx_i])
+    warp_group = cuda.cg.coalesced_group()
+    warp_sum = warp_group.reduce_add(val)
+    total_inv_est = (warp_sum * cfg.INV_MAX) // cfg.INV_SAMPLE_SIZE if cfg.INV_SAMPLE_SIZE > 0 else 0
+    bucket_width = cfg.INV_MAX // cfg.INV_BUCKETS or 1
+    bucket = total_inv_est // bucket_width
+    if bucket >= cfg.INV_BUCKETS: bucket = cfg.INV_BUCKETS - 1
+    return bucket
 
 @cuda.jit(device=True, inline=True)
 def shuffle_deck(deck, rng_states, gid):
-    """Optimized Fisher-Yates shuffle with unrolled final iterations and vectorized loads."""
-    # Unroll final 16 iterations in registers
-    regs = cuda.local.array(16, dtype=numba.int8)
-    for i in range(16):
-        regs[i] = deck[DECK_SIZE-16+i]
-    
-    # Shuffle final 16 elements in registers
-    for i in range(15, 0, -1):
-        j = int(xoroshiro128p_uniform_float64(rng_states, gid) * (i+1))
-        if j > i: j = i
-        regs[i], regs[j] = regs[j], regs[i]
-    
-    # Vectorized shuffle of first half using uint2 loads
-    for i in range(0, DECK_SIZE-16, 2):
-        # Load two elements at once
-        val = cuda.ldg(deck, i)
-        val2 = cuda.ldg(deck, i+1)
-        
-        # Generate two random indices
-        j = int(xoroshiro128p_uniform_float64(rng_states, gid) * (DECK_SIZE-16))
-        j2 = int(xoroshiro128p_uniform_float64(rng_states, gid) * (DECK_SIZE-16))
-        
-        # Swap with vectorized store
-        deck[i] = deck[j]
-        deck[i+1] = deck[j2]
-        deck[j] = val
-        deck[j2] = val2
-    
-    # Store final 16 elements from registers
-    for i in range(16):
-        deck[DECK_SIZE-16+i] = regs[i]
+    for i in range(cfg.DECK_SIZE - 1, 0, -1):
+         j_f = xoroshiro128p_uniform_float64(rng_states, gid)
+         j = int(j_f * (i + 1))
+         if j > i: j = i
+         deck[i], deck[j] = deck[j], deck[i]
 
-@cuda.jit(max_registers=32, inline=True)
-def shuffle_kernel(rng_states,
-                  hist, poker, total, rises, dup,
-                  inv_hist, run_hist):
-    """GPU kernel for shuffling and metrics collection."""
-    # Shared memory for local histograms
-    block_hist = cuda.shared.array(shape=(HIST_BINS,), dtype=numba.int32)
-    block_poker = cuda.shared.array(shape=(POKER_CATS_PER_U32,), dtype=numba.int32)
-    block_inv_hist = cuda.shared.array(shape=(INV_BUCKETS,), dtype=numba.int32)
-    block_run_hist = cuda.shared.array(shape=(RUN_BUCKETS,), dtype=numba.int32)
-    block_r = cuda.shared.array(shape=(2,), dtype=numba.int32)  # [0] for runs, [1] for duplicates
-    
+# --- Kernel Phase 1: Shuffle and Basic Stats ---
+@cuda.jit
+def shuffle_kernel_phase1(rng_states, total, dup, shuffled_decks_d, 
+                          initial_d_k):
+    """Kernel Phase 1: Shuffle decks, check duplicates, write to buffer."""
     tx = cuda.threadIdx.x
     bdx = cuda.blockDim.x
-    lid = tx % WARP_SIZE
-    wid = tx // WARP_SIZE
-    mask = 0xffffffff  # All lanes active
+    bid = cuda.blockIdx.x
+    gid = bid * bdx + tx
 
-    # Initialize shared memory
-    if lid == 0:
-        for i in range(HIST_BINS):
-            block_hist[i] = 0
-        for i in range(POKER_CATS_PER_U32):
-            block_poker[i] = 0
-        for i in range(INV_BUCKETS):
-            block_inv_hist[i] = 0
-        for i in range(RUN_BUCKETS):
-            block_run_hist[i] = 0
-        block_r[0] = 0
-        block_r[1] = 0
-    cuda.syncthreads()
+    deck = cuda.local.array(shape=(cfg.DECK_SIZE,), dtype=numba.int8)
 
-    # Only allocate deck array for first thread in warp
-    deck = cuda.local.array(shape=(DECK_SIZE,), dtype=numba.int8) if lid == 0 else None
-    gid = cuda.grid(1)
+    # Reset deck from passed initial_d_k
+    for i in range(cfg.DECK_SIZE):
+        deck[i] = initial_d_k[i]
 
-    for _ in range(GPU_SHUFFLES_THR):
-        if lid == 0:
-            # reset & shuffle
-            for i in range(DECK_SIZE): deck[i]=i
-            shuffle_deck(deck, rng_states, gid)
+    shuffle_deck(deck, rng_states, gid)
 
-            # Compute metrics using bitboard operations
-            simc = count_similarity(deck, initial_d)
-            runs = count_runs(deck)
-            
-            # Check for exact match (duplicate)
-            match = (simc == DECK_SIZE)
-            if match: cuda.atomic.add(block_r, 1, 1)
-            
-            # Update histograms using warp-level ballot
-            warp_histogram_add(simc, mask, block_hist)
-            warp_histogram_add(runs, mask, block_run_hist)
-            
-            # Compute inversions and update histogram
-            bucket = compute_inversions(deck, rng_states, gid, lid)
-            if lid == 0:
-                warp_histogram_add(bucket, mask, block_inv_hist)
-            
-            # Compute poker hand and update histogram
-            mask = 0
-            s0 = deck[0] // 13
-            flush = 1
-            for i in range(5):
-                c = deck[i]
-                mask |= 1 << (c % 13)
-                flush &= (c // 13 == s0)
-            cat = get_poker_cat(mask, flush)
-            warp_histogram_add(cat, mask, block_poker)
+    # Check for exact match against passed initial_d_k
+    exact_match = True
+    for k in range(cfg.DECK_SIZE):
+        if deck[k] != initial_d_k[k]:
+            exact_match = False
+            break
 
-    # Synchronize all threads before final updates
-    cuda.syncthreads()
+    deck_offset = gid * cfg.DECK_SIZE
+    for i in range(cfg.DECK_SIZE):
+        shuffled_decks_d[deck_offset + i] = deck[i]
 
-    # Single thread per block spawns child kernel for final reduction
-    if tx == 0:
-        # Launch child kernel with 128 threads (4 warps)
-        child_threads = 128
-        child_blocks = 1
-        
-        # Copy block histograms to device memory for child kernel
-        block_hist_d = cuda.device_array(HIST_BINS, dtype=numba.int32)
-        block_poker_d = cuda.device_array(POKER_CATS_PER_U32, dtype=numba.int32)
-        block_inv_hist_d = cuda.device_array(INV_BUCKETS, dtype=numba.int32)
-        block_run_hist_d = cuda.device_array(RUN_BUCKETS, dtype=numba.int32)
-        block_r_d = cuda.device_array(2, dtype=numba.int32)
-        
-        # Copy data to device arrays
-        for i in range(HIST_BINS):
-            block_hist_d[i] = block_hist[i]
-        for i in range(POKER_CATS_PER_U32):
-            block_poker_d[i] = block_poker[i]
-        for i in range(INV_BUCKETS):
-            block_inv_hist_d[i] = block_inv_hist[i]
-        for i in range(RUN_BUCKETS):
-            block_run_hist_d[i] = block_run_hist[i]
-        block_r_d[0] = block_r[0]
-        block_r_d[1] = block_r[1]
-        
-        # Launch child kernel
-        reduce_block_histograms_child[child_blocks, child_threads](
-            block_hist_d, block_poker_d, block_inv_hist_d, block_r_d, block_run_hist_d,
-            hist, poker, inv_hist, run_hist, rises, total, dup
-        )
-        
-        # Free device arrays
-        block_hist_d.free()
-        block_poker_d.free()
-        block_inv_hist_d.free()
-        block_run_hist_d.free()
-        block_r_d.free()
+    cuda.atomic.add(total, 0, 1)
+    if exact_match:
+        cuda.atomic.add(dup, 0, 1)
 
-@cuda.jit(device=True, inline=True)
-def compute_run_buckets(deck):
-    """Compute run length buckets for histogram."""
-    run_len = 1
-    prev = deck[0]
-    buckets = []
-    
-    for i in range(1, DECK_SIZE):
+# --- Kernel Phase 2: Analyze Decks ---
+@cuda.jit(max_registers=64)
+def analyze_kernel_phase2(shuffled_decks_d, hist, poker, rises, inv_hist, run_hist, rng_states,
+                          const_indices_i_d, const_indices_j_d):
+    """Kernel Phase 2: Analyze shuffled decks from buffer."""
+    tx = cuda.threadIdx.x
+    bdx = cuda.blockDim.x
+    bid = cuda.blockIdx.x
+    gid = bid * bdx + tx
+    lid = tx % 32
+
+    deck = cuda.local.array(shape=(cfg.DECK_SIZE,), dtype=numba.int8)
+    deck5 = cuda.local.array(5, dtype=numba.int8)
+
+    deck_offset = gid * cfg.DECK_SIZE
+    for i in range(cfg.DECK_SIZE):
+        deck[i] = shuffled_decks_d[deck_offset + i]
+
+    # Perform Analysis
+    simc = 0; runs = 1; prev_card = deck[0]
+    for k in range(cfg.DECK_SIZE):
+        c = deck[k]
+        simc += (c == k)
+        if k > 0: runs += (c < prev_card)
+        prev_card = c
+        if k < 5: deck5[k] = c
+
+    # Update Histograms/Counters
+    cuda.atomic.add(hist, simc, 1)
+    cuda.atomic.add(rises, 0, runs)
+
+    # Run Length
+    run_len = 1; prev = deck[0]
+    for i in range(1, cfg.DECK_SIZE):
         if deck[i] > prev:
             run_len += 1
         else:
-            bucket = min(RUN_BUCKETS-1, (run_len-1) // (DECK_SIZE // RUN_BUCKETS))
-            buckets.append(bucket)
+            bucket_width_run = cfg.DECK_SIZE // cfg.RUN_BUCKETS or 1
+            bucket = min(cfg.RUN_BUCKETS - 1, (run_len - 1) // bucket_width_run)
+            cuda.atomic.add(run_hist, bucket, 1)
             run_len = 1
         prev = deck[i]
-    
-    bucket = min(RUN_BUCKETS-1, (run_len-1) // (DECK_SIZE // RUN_BUCKETS))
-    buckets.append(bucket)
-    return buckets
+    bucket_width_run = cfg.DECK_SIZE // cfg.RUN_BUCKETS or 1
+    bucket = min(cfg.RUN_BUCKETS - 1, (run_len - 1) // bucket_width_run)
+    cuda.atomic.add(run_hist, bucket, 1)
 
-# Consolidate poker logic into a single function
-@njit(nogil=True, fastmath=True, cache=True)
-def categorize_poker_hand(deck):
-    """Categorize a 5-card poker hand using the LUT.
-    Returns category index (0-8) for the hand.
-    """
-    if deck.shape[0] != 5:
-        return 0  # High card for invalid hands
-        
-    mask = 0
-    s0 = deck[0] // 13
-    flush = 1
-    
-    for i in range(5):
-        c = deck[i]
-        mask |= 1 << (c % 13)
-        if c // 13 != s0:
-            flush = 0
-            
-    return lut_packed[mask | (flush << 13)]
+    # Poker
+    cat = compute_poker_category_device(deck5)
+    cuda.atomic.add(poker, cat, 1)
 
-# ─────────── Dashboard State Abstraction ───────────────────────────────────────
-class DashboardState:
-    def __init__(self, mode, hist_data, total_data, rises_data, poker_data,
-                 inv_hist_data=None, run_hist_data=None, dup_data=None):
-        self.mode = mode
-        self._hist_data = hist_data
-        self._total_data = total_data
-        self._rises_data = rises_data
-        self._poker_data = poker_data
-        # GPU only metrics
-        self._inv_hist_data = inv_hist_data
-        self._run_hist_data = run_hist_data
-        self._dup_data = dup_data
+    # Inversions - pass needed device arrays
+    inv_bucket = compute_inversions(deck, rng_states, gid, tx, 
+                                    const_indices_i_d, const_indices_j_d)
+    if lid == 0:
+        cuda.atomic.add(inv_hist, inv_bucket, 1)
 
-        # Pre-calculate buffer views for CPU mode for efficiency
-        if self.mode == "CPU":
-            # Create stacked arrays for efficient summing
-            self._hist_stack = np.stack([np.frombuffer(b, dtype=np.int32) for b in self._hist_data])
-            self._total_stack = np.stack([np.frombuffer(b, dtype=np.int32) for b in self._total_data])
-            self._rises_stack = np.stack([np.frombuffer(b, dtype=np.int32) for b in self._rises_data])
-            self._poker_stack = np.stack([np.frombuffer(b, dtype=np.int32) for b in self._poker_data])
-            
-            # Initialize master buffers for efficient summing
-            self._master_hist = np.zeros(HIST_BINS, dtype=np.int32)
-            self._master_total = np.zeros(1, dtype=np.int32)
-            self._master_rises = np.zeros(1, dtype=np.int32)
-            self._master_poker = np.zeros(POKER_CATS_PER_U32, dtype=np.int32)
-            self._last_sum_time = perf_counter()
-            
-            # Track histogram changes
-            self._prev_hist = np.zeros(HIST_BINS, dtype=np.int32)
-            self._changed_bins = set()
-        else:  # GPU mode
-            # Unwrap single-element lists into direct buffer views
-            self._hist_view = np.frombuffer(self._hist_data[0], dtype=np.int32)
-            self._total_view = np.frombuffer(self._total_data[0], dtype=np.int32)
-            self._rises_view = np.frombuffer(self._rises_data[0], dtype=np.int32)
-            self._poker_view = np.frombuffer(self._poker_data[0], dtype=np.int32)
-            if self._inv_hist_data:
-                self._inv_hist_view = np.frombuffer(self._inv_hist_data[0], dtype=np.int32)
-            if self._run_hist_data:
-                self._run_hist_view = np.frombuffer(self._run_hist_data[0], dtype=np.int32)
-            if self._dup_data:
-                self._dup_view = np.frombuffer(self._dup_data[0], dtype=np.int32)
-            
-            # Track histogram changes
-            self._prev_hist = np.zeros(HIST_BINS, dtype=np.int32)
-            self._changed_bins = set()
-
-    def _update_master_buffers(self):
-        """Update master buffers with latest worker data and track changes."""
-        current_time = perf_counter()
-        if current_time - self._last_sum_time >= 1.0:  # Update every second
-            if self.mode == "CPU":
-                new_hist = np.sum(self._hist_stack, axis=0)
-                self._master_total[0] = np.sum(self._total_stack)
-                self._master_rises[0] = np.sum(self._rises_stack)
-                self._master_poker[:] = np.sum(self._poker_stack, axis=0)
-            else:
-                new_hist = self._hist_view.copy()
-            
-            # Track changed bins
-            self._changed_bins.clear()
-            for i in range(HIST_BINS):
-                if new_hist[i] != self._prev_hist[i]:
-                    self._changed_bins.add(i)
-            
-            # Update previous histogram
-            self._prev_hist[:] = new_hist
-            self._last_sum_time = current_time
-
-    @property
-    def hist(self):
-        if self.mode == "GPU":
-            return self._hist_view
-        else:
-            self._update_master_buffers()
-            return self._master_hist
-
-    @property
-    def changed_bins(self):
-        """Return the set of bins that changed since last update."""
-        self._update_master_buffers()
-        return self._changed_bins
-
-    @property
-    def total(self):
-        if self.mode == "GPU":
-            return int(self._total_view[0])
-        else:
-            self._update_master_buffers()
-            return int(self._master_total[0])
-
-    @property
-    def rises(self):
-        if self.mode == "GPU":
-            return int(self._rises_view[0])
-        else:
-            self._update_master_buffers()
-            return int(self._master_rises[0])
-
-    @property
-    def poker(self):
-        if self.mode == "GPU":
-            return self._poker_view
-        else:
-            self._update_master_buffers()
-            return self._master_poker
-
-    @property
-    def inv_hist(self):
-        if self.mode == "GPU" and hasattr(self, '_inv_hist_view'):
-            return self._inv_hist_view
-        return None
-
-    @property
-    def run_hist(self):
-        if self.mode == "GPU" and hasattr(self, '_run_hist_view'):
-            return self._run_hist_view
-        return None
-
-    @property
-    def duplicates(self) -> int:
-        if self.mode == "GPU" and hasattr(self, '_dup_view'):
-            return int(self._dup_view[0])
-        return 0
+# ─────────── UI Setup & Workers ──────────────────────────────────────────
 
 def build_layout():
-    """Create and return the UI layout."""
+    # ... (build_layout remains the same) ...
     layout = Layout()
     layout.split_row(
         Layout(name="hist", ratio=2),
@@ -688,362 +607,532 @@ def build_layout():
     layout["side"].split_column(
         Layout(name="stats", ratio=1),
         Layout(name="poker", ratio=1),
-        Layout(name="runs", ratio=1)
+        Layout(name="runs", ratio=1),
+        Layout(name="inv", ratio=1)
     )
     return layout
 
-def _init_gpu_buffers():
-    """Initialize GPU buffers with zero-copy memory."""
-    cuda.select_device(0)
-    dev = cuda.get_current_device()
-    
-    # Calculate optimal block size based on device properties
-    max_threads = dev.MAX_THREADS_PER_BLOCK
-    # Try different thread counts to find optimal occupancy
-    # 128 threads = 4 warps/block, good for register-heavy kernels
-    # 256 threads = 8 warps/block, balanced
-    # 512 threads = 16 warps/block, good for memory-bound kernels
-    threads_per_block = 128  # Start with 128 for better register usage
-    blocks_per_grid = (dev.MULTIPROCESSOR_COUNT * 4)  # Increase blocks to compensate for smaller thread count
-    
-    # Create streams for double buffering
-    streams = [cuda.stream(), cuda.stream()]
-    
-    # Initialize zero-copy buffers for each metric
-    hist_bufs = []
-    total_bufs = []
-    rises_bufs = []
-    poker_bufs = []
-    inv_hist_bufs = []
-    run_hist_bufs = []
-    dup_bufs = []
-    
-    for _ in range(2):
-        # Create true zero-copy mapped arrays (host and device share memory)
-        hist_dev = cuda.mapped_array(HIST_BINS, dtype=np.int32)
-        total_dev = cuda.mapped_array(1, dtype=np.int32)
-        rises_dev = cuda.mapped_array(1, dtype=np.int32)
-        poker_dev = cuda.mapped_array(POKER_CATS_PER_U32, dtype=np.int32)
-        inv_hist_dev = cuda.mapped_array(INV_BUCKETS, dtype=np.int32)
-        run_hist_dev = cuda.mapped_array(RUN_BUCKETS, dtype=np.int32)
-        dup_dev = cuda.mapped_array(1, dtype=np.int32)
-        
-        # Host and device arrays are the same memory
-        hist_host = hist_dev
-        total_host = total_dev
-        rises_host = rises_dev
-        poker_host = poker_dev
-        inv_hist_host = inv_hist_dev
-        run_hist_host = run_hist_dev
-        dup_host = dup_dev
-        
-        # Store both host and device arrays (they're the same memory)
-        hist_bufs.append((hist_host, hist_dev))
-        total_bufs.append((total_host, total_dev))
-        rises_bufs.append((rises_host, rises_dev))
-        poker_bufs.append((poker_host, poker_dev))
-        inv_hist_bufs.append((inv_hist_host, inv_hist_dev))
-        run_hist_bufs.append((run_hist_host, run_hist_dev))
-        dup_bufs.append((dup_host, dup_dev))
-    
-    # Initialize RNG states
-    rng_d = cuda.to_device(create_xoroshiro128p_states(
-        threads_per_block * blocks_per_grid,
-        int.from_bytes(os.urandom(8), 'little')
-    ))
-    
-    return (hist_bufs, poker_bufs, total_bufs, rises_bufs, dup_bufs, inv_hist_bufs, run_hist_bufs,
-            None, None, rng_d, streams, threads_per_block, blocks_per_grid)
-
-def simulation_worker(mode: str, metrics_buffer: MetricsBuffer, stop_evt: mp.Event):
-    """Worker process that runs the simulation and writes metrics to the ring buffer."""
+def _init_gpu_buffers(total_threads):
+    """Initialize GPU buffers, including device constants."""
     try:
-        if mode == "CPU":
-            # Initialize CPU buffers
-            (hist_bufs,
-             total_bufs,
-             rises_bufs,
-             poker_bufs,
-             rng_bufs,
-             run_hist_bufs,
-             _,          # inv_hist (unused)
-             _           # dup (unused)
-            ) = init_buffers(mode)
-            
-            # Start CPU workers
-            workers = []
-            for i in range(CPU_WORKERS):
-                p = mp.Process(
-                    target=shuffle_worker_cpu,
-                    args=(
-                        hist_bufs[i],
-                        total_bufs[i],
-                        rises_bufs[i],
-                        poker_bufs[i],
-                        run_hist_bufs[i],
-                        rng_bufs[i],
-                        stop_evt
-                    )
+        cuda.select_device(0)
+        dev = cuda.get_current_device()
+    except cuda.cudadrv.driver.CudaAPIError as e:
+        print(f"CUDA Error: {e}")
+        return None
+
+    stream = cuda.stream()
+
+    try:
+        # --- Initialize Device Constants Here ---
+        pre_i_host = np.zeros(cfg.INV_MAX, dtype=np.uint8)
+        pre_j_host = np.zeros(cfg.INV_MAX, dtype=np.uint8)
+        idx = 0
+        for i in range(cfg.DECK_SIZE):
+            for j in range(i + 1, cfg.DECK_SIZE):
+                pre_i_host[idx] = i
+                pre_j_host[idx] = j
+                idx += 1
+        
+        initial_d_dev = cuda.to_device(np.arange(cfg.DECK_SIZE, dtype=np.int8), stream=stream)
+        const_indices_i_dev = cuda.to_device(pre_i_host, stream=stream)
+        const_indices_j_dev = cuda.to_device(pre_j_host, stream=stream)
+        # ---------------------------------------
+
+        # Metric buffers (device side)
+        hist_dev = cuda.device_array(cfg.HIST_BINS, dtype=np.int32)
+        poker_dev = cuda.device_array(cfg.POKER_CATEGORIES, dtype=np.int32)
+        total_dev = cuda.device_array(1, dtype=np.int64)
+        rises_dev = cuda.device_array(1, dtype=np.int64)
+        dup_dev = cuda.device_array(1, dtype=np.int64)
+        inv_hist_dev = cuda.device_array(cfg.INV_BUCKETS, dtype=np.int32)
+        run_hist_dev = cuda.device_array(cfg.RUN_BUCKETS, dtype=np.int32)
+        shuffled_decks_dev = cuda.device_array(total_threads * cfg.DECK_SIZE, dtype=np.int8)
+
+        # Host arrays for results
+        hist_host = np.zeros(cfg.HIST_BINS, dtype=np.int32)
+        poker_host = np.zeros(cfg.POKER_CATEGORIES, dtype=np.int32)
+        total_host = np.zeros(1, dtype=np.int64)
+        rises_host = np.zeros(1, dtype=np.int64)
+        dup_host = np.zeros(1, dtype=np.int64)
+        inv_hist_host = np.zeros(cfg.INV_BUCKETS, dtype=np.int32)
+        run_hist_host = np.zeros(cfg.RUN_BUCKETS, dtype=np.int32)
+
+        metric_bufs = {
+            "hist": (hist_host, hist_dev),
+            "poker": (poker_host, poker_dev),
+            "total": (total_host, total_dev),
+            "rises": (rises_host, rises_dev),
+            "dup": (dup_host, dup_dev),
+            "inv_hist": (inv_hist_host, inv_hist_dev),
+            "run_hist": (run_hist_host, run_hist_dev),
+            "shuffled_decks": (None, shuffled_decks_dev)
+        }
+        
+        # Consolidate device arrays needed by kernels
+        kernel_consts = {
+            "initial_d": initial_d_dev,
+            "const_indices_i": const_indices_i_dev,
+            "const_indices_j": const_indices_j_dev
+        }
+
+    except CudaAPIError as e:
+        print(f"Failed to allocate CUDA device memory: {e}")
+        return None
+
+    try:
+        rng_d = create_xoroshiro128p_states(total_threads, seed=int.from_bytes(os.urandom(8), 'little'))
+    except CudaAPIError as e:
+        print(f"Failed to create RNG states on device: {e}")
+        return None
+    
+    stream.synchronize() # Ensure device constants are ready before returning
+    return (metric_bufs, kernel_consts, rng_d, stream)
+
+def simulation_worker_gpu(metrics_buffer: SafeMetricsBuffer, stop_evt: mp.Event):
+    """GPU Worker process launching split kernels."""
+    sim_init_data = None
+    try:
+        cuda.select_device(0)
+        dev = cuda.get_current_device()
+        threads_per_block = 128
+        min_blocks = dev.MULTIPROCESSOR_COUNT * 4
+        blocks_per_grid = max(min_blocks, (dev.MULTIPROCESSOR_COUNT * dev.MAX_THREADS_PER_MULTIPROCESSOR) // threads_per_block)
+        blocks_per_grid = min(blocks_per_grid, 1024)
+        total_threads = threads_per_block * blocks_per_grid
+
+        sim_init_data = _init_gpu_buffers(total_threads)
+        if sim_init_data is None:
+             raise RuntimeError("Failed to initialize GPU resources.")
+
+        (metric_bufs, kernel_consts, rng_d, stream) = sim_init_data
+
+        # Get device pointers and host arrays from metric_bufs
+        hist_dev, poker_dev, total_dev, rises_dev, dup_dev, inv_hist_dev, run_hist_dev, shuffled_decks_dev = (
+            metric_bufs["hist"][1], metric_bufs["poker"][1], metric_bufs["total"][1],
+            metric_bufs["rises"][1], metric_bufs["dup"][1], metric_bufs["inv_hist"][1],
+            metric_bufs["run_hist"][1], metric_bufs["shuffled_decks"][1]
+        )
+        hist_host, poker_host, total_host, rises_host, dup_host, inv_hist_host, run_hist_host = (
+             metric_bufs["hist"][0], metric_bufs["poker"][0], metric_bufs["total"][0],
+             metric_bufs["rises"][0], metric_bufs["dup"][0], metric_bufs["inv_hist"][0],
+             metric_bufs["run_hist"][0]
+        )
+        
+        # Get device constants from kernel_consts
+        initial_d_dev = kernel_consts["initial_d"]
+        const_indices_i_dev = kernel_consts["const_indices_i"]
+        const_indices_j_dev = kernel_consts["const_indices_j"]
+
+        while not stop_evt.is_set():
+             try:
+                # Zero metric buffers
+                stream.synchronize()
+                cuda.driver.device_memset_d32(hist_dev.device_ctypes_pointer, 0, hist_dev.size)
+                cuda.driver.device_memset_d32(poker_dev.device_ctypes_pointer, 0, poker_dev.size)
+                cuda.driver.device_memset_d64(total_dev.device_ctypes_pointer, 0, total_dev.size)
+                cuda.driver.device_memset_d64(rises_dev.device_ctypes_pointer, 0, rises_dev.size)
+                cuda.driver.device_memset_d64(dup_dev.device_ctypes_pointer, 0, dup_dev.size)
+                cuda.driver.device_memset_d32(inv_hist_dev.device_ctypes_pointer, 0, inv_hist_dev.size)
+                cuda.driver.device_memset_d32(run_hist_dev.device_ctypes_pointer, 0, run_hist_dev.size)
+
+                # Launch Kernels - Pass device constants
+                shuffle_kernel_phase1[blocks_per_grid, threads_per_block, stream](
+                    rng_d, total_dev, dup_dev, shuffled_decks_dev, 
+                    initial_d_dev
                 )
-                p.start()
-                workers.append(p)
-            
-            # Main simulation loop
-            while not stop_evt.is_set():
-                # Collect metrics from all workers
-                hist = np.sum([np.frombuffer(b, dtype=np.int32) for b in hist_bufs], axis=0)
-                total = sum(np.frombuffer(b, dtype=np.int32)[0] for b in total_bufs)
-                rises = sum(np.frombuffer(b, dtype=np.int32)[0] for b in rises_bufs)
-                poker = np.sum([np.frombuffer(b, dtype=np.int32) for b in poker_bufs], axis=0)
-                run_hist = np.sum([np.frombuffer(b, dtype=np.int32) for b in run_hist_bufs], axis=0)
-                
-                # Write metrics to ring buffer
-                metrics_buffer.write_metrics({
-                    'hist': hist,
-                    'total': total,
-                    'rises': rises,
-                    'poker': poker,
-                    'run_hist': run_hist,
-                    'timestamp': perf_counter()
-                })
-                
-                sleep(1.0 / cfg.UI_FPS)  # Match UI refresh rate
-            
-            # Clean up
-            for worker in workers:
-                worker.join()
-                
-        else:  # GPU mode
-            # Initialize GPU buffers
-            (hist_bufs,
-             poker_bufs,
-             total_bufs,
-             rises_bufs,
-             dup_bufs,
-             inv_hist_bufs,
-             run_hist_bufs,
-             _,          # init_d (unused, now in constant memory)
-             _,          # lut_d (unused, now in constant memory)
-             rng_d,
-             streams,
-             threads_per_block,
-             blocks_per_grid
-            ) = init_buffers(mode)
-            
-            # Main simulation loop
-            buf_idx = 0
-            while not stop_evt.is_set():
-                s = streams[buf_idx]
-                
-                try:
-                    # Get current buffer pair
-                    hist_host, hist_dev = hist_bufs[buf_idx]
-                    poker_host, poker_dev = poker_bufs[buf_idx]
-                    total_host, total_dev = total_bufs[buf_idx]
-                    rises_host, rises_dev = rises_bufs[buf_idx]
-                    dup_host, dup_dev = dup_bufs[buf_idx]
-                    inv_hist_host, inv_hist_dev = inv_hist_bufs[buf_idx]
-                    run_hist_host, run_hist_dev = run_hist_bufs[buf_idx]
-                    
-                    # Clear host buffers asynchronously
-                    hist_host.fill(0)
-                    poker_host.fill(0)
-                    total_host.fill(0)
-                    rises_host.fill(0)
-                    dup_host.fill(0)
-                    inv_hist_host.fill(0)
-                    run_hist_host.fill(0)
-                    
-                    # Run kernel with updated signature (no initial or lut args)
-                    shuffle_kernel[blocks_per_grid, threads_per_block, s](
-                        rng_d,
-                        hist_dev, poker_dev, total_dev,
-                        rises_dev, dup_dev, inv_hist_dev, run_hist_dev
-                    )
-                    
-                    # Synchronize stream to ensure kernel completion
-                    s.synchronize()
-                    
-                    # Write metrics to ring buffer
-                    metrics_buffer.write_metrics({
-                        'hist': hist_host,
-                        'total': int(total_host[0]),
-                        'rises': int(rises_host[0]),
-                        'poker': poker_host,
-                        'inv_hist': inv_hist_host,
-                        'run_hist': run_hist_host,
-                        'duplicates': int(dup_host[0]),
-                        'timestamp': perf_counter()
-                    })
-                    
-                    # Switch buffer
-                    buf_idx = 1 - buf_idx
-                    
-                except CudaAPIError as e:
-                    print(f"GPU kernel error: {e}", flush=True)
-                    break
-                
-                sleep(1.0 / cfg.UI_FPS)  # Match UI refresh rate
-            
-            # Clean up
-            cuda.close()
-            
-    except Exception as e:
-        print(f"Simulation error: {e}", flush=True)
-    finally:
-        metrics_buffer.close()
+                analyze_kernel_phase2[blocks_per_grid, threads_per_block, stream](
+                    shuffled_decks_dev, hist_dev, poker_dev, rises_dev,
+                    inv_hist_dev, run_hist_dev, rng_d,
+                    const_indices_i_dev, const_indices_j_dev
+                )
 
-def ui_worker(metrics_buffer: MetricsBuffer, stop_evt: mp.Event):
-    """Worker process that handles UI rendering with partial updates."""
+                # Copy results back
+                hist_dev.copy_to_host(hist_host, stream=stream)
+                poker_dev.copy_to_host(poker_host, stream=stream)
+                total_dev.copy_to_host(total_host, stream=stream)
+                rises_dev.copy_to_host(rises_host, stream=stream)
+                dup_dev.copy_to_host(dup_host, stream=stream)
+                inv_hist_dev.copy_to_host(inv_hist_host, stream=stream)
+                run_hist_dev.copy_to_host(run_hist_host, stream=stream)
+                stream.synchronize()
+
+                # Write metrics
+                metrics_to_write = {
+                    'hist': hist_host,
+                    'total': int(total_host[0]),
+                    'rises': int(rises_host[0]),
+                    'poker': poker_host,
+                    'inv_hist': inv_hist_host,
+                    'run_hist': run_hist_host,
+                    'duplicates': int(dup_host[0])
+                }
+                metrics_buffer.write_metrics(metrics_to_write)
+                sleep(0.001)
+
+             except CudaAPIError as e:
+                print(f"GPU Error: {e}", flush=True)
+                stop_evt.set(); break
+             except Exception as e:
+                print(f"Sim loop Error: {e}", flush=True)
+                stop_evt.set(); break
+    except Exception as e:
+        print(f"Sim worker Error: {e}", flush=True)
+        stop_evt.set()
+    finally:
+        print("GPU Simulation worker exiting.")
+
+def simulation_worker_cpu(metrics_buffer: SafeMetricsBuffer, stop_evt: mp.Event):
+    """CPU Worker process performing simulation in chunks."""
     try:
-        # Create UI layout
+        rng = np.random.default_rng()
+        deck = np.arange(cfg.DECK_SIZE, dtype=np.int8)
+        deck5 = np.empty(5, dtype=np.int8)
+
+        inv_bucket_width = cfg.INV_MAX // cfg.INV_BUCKETS or 1
+
+        while not stop_evt.is_set():
+            chunk_hist = np.zeros(cfg.HIST_BINS, dtype=np.int32)
+            chunk_poker = np.zeros(cfg.POKER_CATEGORIES, dtype=np.int32)
+            chunk_inv = np.zeros(cfg.INV_BUCKETS, dtype=np.int32)
+            chunk_run = np.zeros(cfg.RUN_BUCKETS, dtype=np.int32)
+            chunk_total = 0
+            chunk_rises = 0
+            chunk_dup = 0
+
+            for _ in range(cfg.CPU_CHUNK_SIZE):
+                np.copyto(deck, np.arange(cfg.DECK_SIZE, dtype=np.int8))
+                shuffle_deck_cpu(deck, rng)
+                
+                simc, runs, exact_match = compute_metrics_cpu(deck, cfg.DECK_SIZE)
+                np.copyto(deck5, deck[:5])
+                cat = compute_poker_category_cpu(deck5)
+                inversions = compute_exact_inversions_cpu(deck)
+                run_hist_delta = compute_run_buckets_cpu(deck)
+
+                chunk_hist[simc] += 1
+                chunk_poker[cat] += 1
+                inv_bucket = min(cfg.INV_BUCKETS - 1, inversions // inv_bucket_width)
+                chunk_inv[inv_bucket] += 1
+                chunk_run += run_hist_delta
+                chunk_total += 1
+                chunk_rises += runs
+                if exact_match: chunk_dup += 1
+
+            metrics_to_write = {
+                'hist': chunk_hist,
+                'total': chunk_total,
+                'rises': chunk_rises,
+                'poker': chunk_poker,
+                'inv_hist': chunk_inv,
+                'run_hist': chunk_run,
+                'duplicates': chunk_dup
+            }
+            metrics_buffer.write_metrics(metrics_to_write)
+            sleep(0.01)
+
+    except Exception as e:
+        print(f"CPU Sim worker Error: {e}", flush=True)
+        stop_evt.set()
+    finally:
+        print("CPU Simulation worker exiting.")
+
+def ui_worker(metrics_buffer: SafeMetricsBuffer, stop_evt: mp.Event):
+    try:
+        print("UI Worker: Initializing layout...", flush=True)
         layout = build_layout()
         t0 = perf_counter()
         
-        # Create a dictionary to store individual line panels
-        hist_lines = {}
-        for i in range(HIST_BINS):
-            hist_lines[i] = Panel("", height=1)
+        def render_stats(metrics, elapsed):
+            table = Table(title="Stats")
+            table.add_column("Metric"); table.add_column("Value")
+            total_shuffles = metrics.get('total', 0)
+            rate = total_shuffles / elapsed if elapsed > 0 else 0
+            table.add_row("Elapsed", f"{elapsed:.2f} s")
+            table.add_row("Shuffles", f"{total_shuffles:,d}")
+            table.add_row("Rate (k/s)", f"{rate / 1e3:.2f}")
+            table.add_row("Duplicates", f"{metrics.get('duplicates', 0):,d}")
+            return Panel(table, title="Statistics", border_style="green")
+            
+        def render_poker(metrics):
+            poker_cats = list(POKER_CATEGORIES_MAP.values())
+            poker_hist = metrics.get('poker', np.zeros(cfg.POKER_CATEGORIES, dtype=np.int64))
+            total_hands = poker_hist.sum()
+            table = Table(title="Poker Hands (First 5 Cards)")
+            table.add_column("Category"); table.add_column("Count"); table.add_column("%")
+            for i, cat in enumerate(poker_cats):
+                count = poker_hist[i] if i < len(poker_hist) else 0
+                percent = (count / total_hands * 100) if total_hands > 0 else 0
+                table.add_row(cat, f"{int(count):,d}", f"{percent:.4f}%")
+            return Panel(table, title="Poker Frequencies", border_style="magenta")
+            
+        def render_runs(metrics):
+            run_hist = metrics.get('run_hist', np.zeros(cfg.RUN_BUCKETS, dtype=np.int64))
+            total_runs = run_hist.sum(); max_val = run_hist.max() if total_runs > 0 else 1
+            lines = []
+            bucket_width = cfg.DECK_SIZE // cfg.RUN_BUCKETS or 1
+            for i in range(cfg.RUN_BUCKETS):
+                count = run_hist[i]
+                bar_len = int((count / max_val) * cfg.HIST_WIDTH) if max_val > 0 else 0
+                bar = '█' * bar_len
+                len_start = i * bucket_width + 1; len_end = (i + 1) * bucket_width
+                label = f"{len_start}-{len_end}" if bucket_width > 1 else f"{len_start}"
+                lines.append(f"{label:>5s} │ {bar} [{int(count):,d}]") 
+            return Panel("\n".join(lines), title=f"Run Lengths (Buckets: {cfg.RUN_BUCKETS})", border_style="yellow")
+            
+        def render_inv(metrics):
+            inv_hist = metrics.get('inv_hist', np.zeros(cfg.INV_BUCKETS, dtype=np.int64))
+            total_inv = inv_hist.sum(); max_val = inv_hist.max() if total_inv > 0 else 1
+            lines = []
+            bucket_width = cfg.INV_MAX // cfg.INV_BUCKETS or 1
+            for i in range(cfg.INV_BUCKETS):
+                count = inv_hist[i]
+                bar_len = int((count / max_val) * cfg.HIST_WIDTH) if max_val > 0 else 0
+                bar = '█' * bar_len
+                inv_start = i * bucket_width; inv_end = (i + 1) * bucket_width -1
+                label = f"{inv_start}-{inv_end}"
+                lines.append(f"{label:>9s} │ {bar} [{int(count):,d}]")
+            return Panel("\n".join(lines), title=f"Inversions (Buckets: {cfg.INV_BUCKETS}, Max: {cfg.INV_MAX})", border_style="blue")
+            
+        def render_hist(metrics):
+            hist = metrics.get('hist', np.zeros(cfg.HIST_BINS, dtype=np.int64))
+            total = hist.sum(); max_val = hist.max() if total > 0 else 1
+            lines = []
+            for i in range(cfg.HIST_BINS):
+                if i >= len(hist): continue
+                count = hist[i]
+                bar_len = int((count / max_val) * cfg.HIST_WIDTH) if max_val > 0 else 0
+                bar = '█' * bar_len
+                percent = (count / total * 100) if total > 0 else 0
+                lines.append(f"{i:3d} │ {bar:<{cfg.HIST_WIDTH}}│ {percent:5.1f}% ({int(count):,d})")
+            return "\n".join(lines)
         
-        # Create the main histogram panel with all line panels
-        hist_panel = Panel("\n".join(hist_lines[i].renderable for i in range(HIST_BINS)),
-                          title="Positional Similarity", border_style="cyan")
-        layout["hist"].update(hist_panel)
+        print("UI Worker: Setting up initial layout...", flush=True)
+        # Initial layout setup
+        layout["hist"].update(Panel(render_hist({}), title="Positional Similarity", border_style="cyan"))
+        layout["side"]["stats"].update(render_stats({}, 0))
+        layout["side"]["poker"].update(render_poker({}))
+        layout["side"]["runs"].update(render_runs({}))
+        layout["side"]["inv"].update(render_inv({}))
         
-        with Live(layout, refresh_per_second=cfg.UI_FPS, screen=True) as live:
-            while not stop_evt.is_set():
-                # Read latest metrics from ring buffer
-                metrics = metrics_buffer.read_metrics()
-                if metrics is None:
-                    sleep(1.0 / cfg.UI_FPS)
-                    continue
-                
-                # Update UI
-                elapsed = metrics['timestamp'] - t0
-                
-                # Update only changed histogram lines
-                for i, line in render_hist(metrics):
-                    hist_lines[i].update(line)
-                
-                # Update other panels
-                layout["side"]["stats"].update(render_stats(metrics, elapsed))
-                layout["side"]["poker"].update(render_poker(metrics))
-                layout["side"]["runs"].update(render_runs(metrics))
-                
-                sleep(1.0 / cfg.UI_FPS)
-                
+        print("UI Worker: Configuring terminal...", flush=True)
+        from rich.console import Console
+        from rich.terminal_theme import TerminalTheme
+        from rich.theme import Theme
+        
+        # Create a custom theme that's more compatible
+        theme = Theme({
+            "info": "dim cyan",
+            "warning": "yellow",
+            "danger": "bold red"
+        })
+        
+        # Configure console with explicit settings
+        console = Console(
+            theme=theme,
+            force_terminal=True,
+            force_interactive=True,
+            color_system="auto",
+            width=None,  # Let it auto-detect
+            height=None,  # Let it auto-detect
+            record=True
+        )
+        
+        print("UI Worker: Terminal configuration complete", flush=True)
+        print(f"Terminal size: {console.size}", flush=True)
+        print(f"Terminal is interactive: {console.is_interactive}", flush=True)
+        print(f"Terminal supports color: {console.color_system}", flush=True)
+        
+        print("UI Worker: Entering Live context...", flush=True)
+        try:
+            # First try without screen mode
+            with Live(
+                layout,
+                refresh_per_second=cfg.UI_FPS,
+                screen=False,  # Changed from True to False
+                transient=False,  # Changed from True to False
+                console=console,
+                auto_refresh=True,
+                vertical_overflow="visible"
+            ) as live:
+                print("UI Worker: Live context entered successfully", flush=True)
+                # Initialize accumulator with correct dtypes matching MetricsDataStruct
+                total_metrics = { 
+                    'hist': np.zeros(cfg.HIST_BINS, dtype=np.int32),
+                    'poker': np.zeros(cfg.POKER_CATEGORIES, dtype=np.int32),
+                    'run_hist': np.zeros(cfg.RUN_BUCKETS, dtype=np.int32),
+                    'inv_hist': np.zeros(cfg.INV_BUCKETS, dtype=np.int32),
+                    'total': np.int64(0),
+                    'rises': np.int64(0),
+                    'duplicates': np.int64(0)
+                }
+                last_update_time = t0
+                print("UI Worker: Starting main loop...", flush=True)
+                while not stop_evt.is_set():
+                    try:
+                        metrics_batch = metrics_buffer.read_metrics()
+                        if metrics_batch is None:
+                            sleep(0.01)
+                            continue
+                        
+                        print("UI Worker: Updating metrics...", flush=True)
+                        # Accumulate metrics - Ensure types are compatible
+                        total_metrics['hist'] += metrics_batch['hist'].astype(np.int32)
+                        total_metrics['poker'] += metrics_batch['poker'].astype(np.int32)
+                        total_metrics['run_hist'] += metrics_batch['run_hist'].astype(np.int32)
+                        total_metrics['inv_hist'] += metrics_batch['inv_hist'].astype(np.int32)
+                        total_metrics['total'] += np.int64(metrics_batch['total'])
+                        total_metrics['rises'] += np.int64(metrics_batch['rises'])
+                        total_metrics['duplicates'] += np.int64(metrics_batch['duplicates'])
+                        
+                        current_time = perf_counter()
+                        elapsed_total = current_time - t0
+                        
+                        print("UI Worker: Updating layout...", flush=True)
+                        # Update layout components 
+                        layout["hist"].update(Panel(render_hist(total_metrics), title="Positional Similarity", border_style="cyan"))
+                        layout["side"]["stats"].update(render_stats(total_metrics, elapsed_total))
+                        layout["side"]["poker"].update(render_poker(total_metrics))
+                        layout["side"]["runs"].update(render_runs(total_metrics))
+                        layout["side"]["inv"].update(render_inv(total_metrics))
+                        
+                        last_update_time = current_time
+                    except Exception as e:
+                        print(f"UI Worker: Error in main loop: {e}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                        break
+        except Exception as e:
+            print(f"UI Worker: Error in Live context: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
+                    
     except KeyboardInterrupt:
-        print("\033[2J\033[H", end="", flush=True)
+        print("\nUI Worker Interrupted.", flush=True)
     except Exception as e:
-        print(f"UI error: {e}", flush=True)
+        print(f"\nUI error: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
     finally:
+        print("UI Worker exiting.")
         stop_evt.set()
 
 def main():
     print("🚀 Starting Dashboard with Metrics — Ctrl‑C to quit", flush=True)
-    
+
     stop_evt = None
-    metrics_buffer = None
-    
+    safe_buffer_instance = None
+    sim_proc = None
+    ui_proc = None
+    is_shm_creator = False
+
     try:
         # Determine execution mode
-        use_gpu = cuda.is_available()
+        try:
+            use_gpu = cuda.is_available()
+            if use_gpu:
+                cuda.select_device(0) # Check if context can be created
+        except Exception as e:
+            print(f"CUDA Check failed: {e}")
+            use_gpu = False
+            
         mode = "GPU" if use_gpu else "CPU"
         print(f"Using {mode} mode for simulation", flush=True)
-        
-        # Create shared metrics buffer
-        if os.name == 'nt':  # Windows
-            metrics_buffer = MetricsBuffer("shuffle_metrics", use_windows=True)
-        else:  # Linux/Unix
-            metrics_buffer = MetricsBuffer("shuffle_metrics")
-        
-        # Create stop event
+
+        # Create shared buffer
+        is_shm_creator = True
+        safe_buffer_instance = SafeMetricsBuffer(create=True, name=SHM_NAME)
         stop_evt = mp.Event()
-        
+
+        # Select target worker function based on mode
+        if mode == "GPU":
+            target_worker = simulation_worker_gpu_process_wrapper
+            print("Targeting GPU worker...")
+        else:
+            target_worker = cpu_simulation_worker_process_wrapper
+            print("Targeting CPU worker...")
+
         # Start simulation and UI processes
-        sim_proc = mp.Process(target=simulation_worker, args=(mode, metrics_buffer, stop_evt))
-        ui_proc = mp.Process(target=ui_worker, args=(metrics_buffer, stop_evt))
-        
+        sim_proc = mp.Process(target=target_worker, args=(SHM_NAME, stop_evt), daemon=True)
+        ui_proc = mp.Process(target=ui_worker_process_wrapper, args=(SHM_NAME, stop_evt), daemon=True)
+
+        print("Starting simulation process...")
         sim_proc.start()
+        print("Starting UI process...")
         ui_proc.start()
-        
-        # Wait for processes to finish
-        sim_proc.join()
+
         ui_proc.join()
-        
+        print("UI process finished.")
+
+    except KeyboardInterrupt:
+        print("\nCtrl+C detected, shutting down...", flush=True)
     except Exception as e:
-        print(f"\nError: {e}", flush=True)
+        print(f"\nMain process error: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
     finally:
-        if stop_evt is not None:
+        print("Initiating cleanup...")
+        if stop_evt:
+            print("Signaling processes to stop...")
             stop_evt.set()
-        if metrics_buffer is not None:
-            metrics_buffer.close()
+        sleep(0.5)
+        if sim_proc and sim_proc.is_alive():
+            print("Terminating simulation process...")
+            sim_proc.terminate(); sim_proc.join(timeout=1)
+        if ui_proc and ui_proc.is_alive():
+            print("Terminating UI process...")
+            ui_proc.terminate(); ui_proc.join(timeout=1)
+        if is_shm_creator and safe_buffer_instance:
+            print(f"Cleaning up shared memory '{SHM_NAME}'...")
+            safe_buffer_instance.unlink()
+            safe_buffer_instance = None
+            print("Shared memory cleaned up.")
+        elif safe_buffer_instance:
+             safe_buffer_instance.close()
+             safe_buffer_instance = None
+        print("Cleanup complete. Exiting.")
+
+# Wrapper for GPU simulation process
+def simulation_worker_gpu_process_wrapper(shm_name, stop_evt):
+    buffer_instance = None
+    try:
+        buffer_instance = SafeMetricsBuffer(create=False, name=shm_name)
+        simulation_worker_gpu(buffer_instance, stop_evt)
+    except Exception as e:
+        print(f"[GPU Sim Wrapper] Error: {e}")
+        stop_evt.set()
+    finally:
+        if buffer_instance: buffer_instance.close()
+        print("[GPU Sim Wrapper] Exiting.")
+
+# Wrapper for CPU simulation process
+def cpu_simulation_worker_process_wrapper(shm_name, stop_evt):
+    buffer_instance = None
+    try:
+        buffer_instance = SafeMetricsBuffer(create=False, name=shm_name)
+        simulation_worker_cpu(buffer_instance, stop_evt)
+    except Exception as e:
+        print(f"[CPU Sim Wrapper] Error: {e}")
+        stop_evt.set()
+    finally:
+        if buffer_instance: buffer_instance.close()
+        print("[CPU Sim Wrapper] Exiting.")
+
+# Wrapper for UI process
+def ui_worker_process_wrapper(shm_name, stop_evt):
+    buffer_instance = None
+    try:
+        buffer_instance = SafeMetricsBuffer(create=False, name=shm_name)
+        ui_worker(buffer_instance, stop_evt)
+    except Exception as e:
+        print(f"[UI Wrapper] Error: {e}")
+        stop_evt.set()
+    finally:
+        if buffer_instance: buffer_instance.close()
+        print("[UI Wrapper] Exiting.")
 
 if __name__ == "__main__":
+    if sys.platform.startswith('win'):
+        mp.freeze_support()
     main()
-
-# Add bitboard utilities
-@cuda.jit(device=True, inline=True)
-def deck_to_bitboards(deck):
-    """Convert deck to four 64-bit bitboards (one per quarter)."""
-    b0 = np.uint64(0)
-    b1 = np.uint64(0)
-    b2 = np.uint64(0)
-    b3 = np.uint64(0)
-    
-    for i in range(DECK_SIZE):
-        if i < 16:
-            b0 |= np.uint64(1) << (deck[i] * 4)
-        elif i < 32:
-            b1 |= np.uint64(1) << (deck[i] * 4)
-        elif i < 48:
-            b2 |= np.uint64(1) << (deck[i] * 4)
-        else:
-            b3 |= np.uint64(1) << (deck[i] * 4)
-    return b0, b1, b2, b3
-
-@cuda.jit(device=True, inline=True)
-def count_similarity(deck, initial_d):
-    """Count similar cards using bitboard operations."""
-    b0, b1, b2, b3 = deck_to_bitboards(deck)
-    # Use __ldg for constant memory access
-    i0 = cuda.ldg(initial_d, 0)
-    i1 = cuda.ldg(initial_d, 1)
-    i2 = cuda.ldg(initial_d, 2)
-    i3 = cuda.ldg(initial_d, 3)
-    
-    # Count matches in each quarter
-    same0 = ~(b0 ^ i0)
-    same1 = ~(b1 ^ i1)
-    same2 = ~(b2 ^ i2)
-    same3 = ~(b3 ^ i3)
-    
-    # Sum popcounts
-    return (cuda.popc(same0) + cuda.popc(same1) + 
-            cuda.popc(same2) + cuda.popc(same3)) // 4
-
-@cuda.jit(device=True, inline=True)
-def count_runs(deck):
-    """Count runs using bitboard operations."""
-    b0, b1, b2, b3 = deck_to_bitboards(deck)
-    
-    # Shift and mask to find rising edges
-    rising0 = (b0 >> 4) & ~b0
-    rising1 = (b1 >> 4) & ~b1
-    rising2 = (b2 >> 4) & ~b2
-    rising3 = (b3 >> 4) & ~b3
-    
-    # Sum rising edges
-    return (cuda.popc(rising0) + cuda.popc(rising1) + 
-            cuda.popc(rising2) + cuda.popc(rising3)) + 1
-
-@cuda.jit(device=True, inline=True)
-def warp_histogram_add(val, mask, hist):
-    """Add a value to histogram using warp-level ballot."""
-    # Get lane mask for this value
-    lane_mask = cuda.ballot_sync(mask, val)
-    
-    # Only first active lane for each value does the atomic add
-    if lane_mask & (1 << cuda.laneid):
-        count = cuda.popc(lane_mask)
-        cuda.atomic.add(hist, val, count)
